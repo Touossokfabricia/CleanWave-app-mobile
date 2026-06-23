@@ -1,0 +1,453 @@
+// ============================================================
+// prisma/schema.prisma
+//
+// Schéma de base de données CleanWave — Version complète
+//
+// Architecture :
+//   - 4 rôles : admin, partenaire, collecteur, citoyen
+//   - Gestion des localisations (quartiers)
+//   - Plannings de collecte avec étapes par quartier
+//   - Signalements avec types de déchets (N-N)
+//   - Primes / récompenses pour citoyens
+//   - Paramètres utilisateur (mode sombre, etc.)
+//
+// IMPORTANT : Base de données hébergée sur Supabase (PostgreSQL).
+// Utiliser `npx prisma db push` pour synchroniser sans migration.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+  schemas   = ["public", "auth"]
+}
+
+// ============================================================
+// ÉNUMÉRATIONS
+// ============================================================
+
+// Rôles des utilisateurs dans l'application
+enum Role {
+  admin       // Administrateur de la plateforme
+  partenaire  // Agence de collecte partenaire
+  collecteur  // Agent de collecte terrain
+  citoyen     // Utilisateur standard
+}
+
+// Statuts d'un signalement
+enum StatutSignalement {
+  en_attente    // Signalement créé, en attente de prise en charge
+  pris_en_charge // Un collecteur a accepté le signalement
+  resolu        // Le signalement a été traité
+  annule        // Signalement annulé
+}
+
+// Statuts d'un planning de collecte
+enum StatutPlanning {
+  planifie  // Planning créé, pas encore démarré
+  en_cours  // Collecte en cours
+  termine   // Tournée terminée
+  annule    // Planning annulé
+}
+
+// Statuts d'une prime / récompense
+enum StatutPrime {
+  en_attente // Prime calculée, pas encore versée
+  versee     // Prime versée au citoyen
+  annulee    // Prime annulée
+}
+
+// Statuts d'un itinéraire envoyé au collecteur
+enum StatutItineraire {
+  brouillon // Créé par le partenaire, pas encore envoyé
+  envoye    // Envoyé au collecteur
+  en_cours  // Collecte en cours
+  termine   // Tournée terminée
+  annule    // Itinéraire annulé
+}
+
+// ============================================================
+// MODÈLE : Profile
+//
+// Représente tout utilisateur de l'application.
+// L'id correspond à l'UUID de Supabase Auth (auth.users).
+//
+// Le champ `type` (enum Role) définit ce que l'utilisateur peut faire.
+// Lors de l'inscription publique : type = citoyen (automatique).
+// L'admin peut créer des comptes admin ou partenaire.
+// ============================================================
+model Profile {
+  id              String    @id @db.Uuid
+  nom             String    @db.VarChar(100)
+  prenom          String?   @db.VarChar(100)
+  email           String    @unique @db.VarChar(255)
+  telephone       String?   @db.VarChar(20)
+  type            Role      @default(citoyen)
+  avatar_url      String?   @db.Text
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime  @updatedAt @db.Timestamptz(6)
+
+  // Lien vers la localisation (quartier) choisie lors de l'inscription
+  // Obligatoire pour les citoyens, optionnel pour les autres rôles
+  localisation_id BigInt?
+  localisation    Localisation? @relation(fields: [localisation_id], references: [id])
+
+  // Relations
+  signalements_emis     Signalement[]  @relation("CitoyenSignalements")
+  signalements_assignes Signalement[]  @relation("CollecteurSignalements")
+  plannings_crees       Planning[]     @relation("PartenaireplanningS")
+  chat_messages         ChatMessage[]
+  primes                Prime[]        @relation("CitoyenPrimes")
+  settings              UserSettings?
+
+  // Si ce profil est un collecteur, il a une fiche collecteur associée
+  fiche_collecteur      Collecteur?    @relation("ProfileCollecteur")
+
+  // Si ce profil est un partenaire, il gère des collecteurs
+  collecteurs_geres     Collecteur[]   @relation("PartenaireCollecteurs")
+  itineraires_crees     Itineraire[]   @relation("PartenaireItineraires")
+
+  @@map("profiles")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : Localisation
+//
+// Table des quartiers / zones géographiques disponibles.
+// Gérée par l'administrateur.
+// Utilisée par : citoyens (inscription), partenaires (plannings).
+// ============================================================
+model Localisation {
+  id          BigInt   @id @default(autoincrement())
+  nom         String   @unique @db.VarChar(150)  // Nom du quartier
+  ville       String   @db.VarChar(100)           // Ville
+  description String?  @db.Text
+  latitude    Decimal? @db.Decimal(10, 8)         // Centre du quartier
+  longitude   Decimal? @db.Decimal(11, 8)
+  est_active  Boolean  @default(true)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime @updatedAt @db.Timestamptz(6)
+
+  // Relations
+  profiles       Profile[]        // Citoyens de ce quartier
+  etapes         EtapePlanning[]  // Étapes de planning dans ce quartier
+  depots         Depot[]          // Points de dépôt dans ce quartier
+  signalements   Signalement[]    // Signalements liés à ce quartier
+  arrets_itineraire ItineraireStop[]
+
+  @@map("localisations")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : Collecteur
+//
+// Représente un agent de collecte terrain.
+// Chaque collecteur est OBLIGATOIREMENT lié à un seul partenaire.
+// Créé par un partenaire depuis son dashboard.
+// ============================================================
+model Collecteur {
+  id           BigInt   @id @default(autoincrement())
+  profile_id   String   @unique @db.Uuid   // Lien vers le compte utilisateur
+  partenaire_id String  @db.Uuid            // Partenaire qui gère ce collecteur
+  matricule    String?  @db.VarChar(50)     // Identifiant interne (optionnel)
+  est_actif    Boolean  @default(true)
+  created_at   DateTime @default(now()) @db.Timestamptz(6)
+  updated_at   DateTime @updatedAt @db.Timestamptz(6)
+
+  // Relations
+  profile     Profile      @relation("ProfileCollecteur", fields: [profile_id], references: [id])
+  partenaire  Profile      @relation("PartenaireCollecteurs", fields: [partenaire_id], references: [id])
+  itineraires Itineraire[]
+
+  @@map("collecteurs")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : Depot
+//
+// Point de dépôt de déchets géolocalisé, enregistré par l'admin.
+// Affiché sur la carte dans l'écran "Signaler".
+// ============================================================
+model Depot {
+  id              BigInt        @id @default(autoincrement())
+  latitude        Decimal       @db.Decimal(10, 8)
+  longitude       Decimal       @db.Decimal(11, 8)
+  nom             String        @db.VarChar(150)
+  description     String?       @db.Text
+  type_dechets    String        @db.VarChar(100)  // Types acceptés (texte libre ou enum futur)
+  est_actif       Boolean       @default(true)
+  created_at      DateTime      @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime      @updatedAt @db.Timestamptz(6)
+
+  // Localisation du dépôt
+  localisation_id BigInt?
+  localisation    Localisation? @relation(fields: [localisation_id], references: [id])
+
+  // Un dépôt peut être référencé dans plusieurs signalements
+  signalements    Signalement[]
+  arrets_itineraire ItineraireStop[]
+
+  @@map("depots")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : TypeDechet
+//
+// Catalogue des types de déchets disponibles.
+// Utilisé dans les signalements (relation N-N).
+// Exemple : Plastique, Verre, Métal, Organiques, Électronique...
+// ============================================================
+model TypeDechet {
+  id          BigInt   @id @default(autoincrement())
+  nom         String   @unique @db.VarChar(100)
+  description String?  @db.Text
+  icone       String?  @db.VarChar(50)    // Nom de l'icône (ex: "leaf", "battery")
+  couleur     String?  @db.VarChar(7)     // Code hexadécimal (#3AB795)
+  est_actif   Boolean  @default(true)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+
+  // Relation N-N avec Signalement (via table pivot)
+  signalements SignalementTypeDechet[]
+
+  @@map("types_dechets")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : Signalement
+//
+// Table CENTRALE de l'application.
+// Un citoyen signale un dépôt sauvage ou une zone à nettoyer.
+// Un collecteur peut prendre en charge ce signalement.
+//
+// Relations N-N avec TypeDechet via SignalementTypeDechet.
+// ============================================================
+model Signalement {
+  id                   BigInt            @id @default(autoincrement())
+  user_id              String            @db.Uuid          // Citoyen qui signale
+  collecteur_id        String?           @db.Uuid          // Collecteur assigné (optionnel)
+  depot_id             BigInt?                             // Dépôt le plus proche (optionnel)
+  localisation_id      BigInt?                             // Quartier (table Localisation)
+  localisation         String            @db.Text          // Adresse en texte libre
+  latitude             Decimal           @db.Decimal(10, 8)
+  longitude            Decimal           @db.Decimal(11, 8)
+  description          String            @db.Text
+  etat                 StatutSignalement @default(en_attente)
+  photo_url            String?           @db.Text          // Rendu optionnel
+  date_signalement     DateTime          @default(now()) @db.Timestamptz(6)
+  date_prise_en_charge DateTime?         @db.Timestamptz(6)
+  date_resolution      DateTime?         @db.Timestamptz(6)
+  created_at           DateTime          @default(now()) @db.Timestamptz(6)
+  updated_at           DateTime          @updatedAt @db.Timestamptz(6)
+
+  // Relations
+  citoyen              Profile                  @relation("CitoyenSignalements", fields: [user_id], references: [id])
+  collecteur           Profile?                 @relation("CollecteurSignalements", fields: [collecteur_id], references: [id])
+  depot                Depot?                   @relation(fields: [depot_id], references: [id])
+  quartier             Localisation?            @relation(fields: [localisation_id], references: [id])
+  types_dechets        SignalementTypeDechet[]  // N-N : plusieurs types de déchets par signalement
+
+  @@map("signalements")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : SignalementTypeDechet (table pivot N-N)
+//
+// Permet à un signalement d'avoir PLUSIEURS types de déchets
+// et à un type de déchet d'apparaître dans PLUSIEURS signalements.
+// ============================================================
+model SignalementTypeDechet {
+  signalement_id BigInt
+  type_dechet_id BigInt
+
+  signalement Signalement @relation(fields: [signalement_id], references: [id], onDelete: Cascade)
+  type_dechet TypeDechet  @relation(fields: [type_dechet_id], references: [id])
+
+  @@id([signalement_id, type_dechet_id])
+  @@map("signalement_type_dechet")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : Planning
+//
+// Tournée de collecte planifiée par un partenaire.
+// Chaque planning peut couvrir plusieurs quartiers (via EtapePlanning).
+// ============================================================
+model Planning {
+  id             BigInt         @id @default(autoincrement())
+  partenaire_id  String         @db.Uuid
+  titre          String         @db.VarChar(200)       // Titre du planning
+  description    String?        @db.Text
+  date_collecte  DateTime       @db.Date
+  statut         StatutPlanning @default(planifie)
+  camion_assigne String?        @db.VarChar(100)        // Optionnel
+  notes          String?        @db.Text
+  created_at     DateTime       @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime       @updatedAt @db.Timestamptz(6)
+
+  // Relations
+  partenaire     Profile        @relation("PartenaireplanningS", fields: [partenaire_id], references: [id])
+  etapes         EtapePlanning[]   // Détail par quartier
+  itineraires    Itineraire[]
+
+  @@map("plannings")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : EtapePlanning
+//
+// Représente un quartier + heure de passage dans un planning.
+// Un planning peut avoir plusieurs étapes (plusieurs quartiers).
+// ============================================================
+model EtapePlanning {
+  id              BigInt       @id @default(autoincrement())
+  planning_id     BigInt
+  localisation_id BigInt                               // Quartier concerné
+  heure_debut     String       @db.VarChar(5)         // Format "HH:MM"
+  heure_fin       String       @db.VarChar(5)         // Format "HH:MM"
+  ordre           Int          @default(0)             // Ordre de passage
+  notes           String?      @db.Text
+  created_at      DateTime     @default(now()) @db.Timestamptz(6)
+
+  // Relations
+  planning        Planning     @relation(fields: [planning_id], references: [id], onDelete: Cascade)
+  localisation    Localisation @relation(fields: [localisation_id], references: [id])
+
+  @@map("etapes_planning")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : Itineraire
+//
+// Itinéraire créé par un partenaire et envoyé à un collecteur.
+// Peut être lié à un planning ou être indépendant.
+// ============================================================
+model Itineraire {
+  id            BigInt           @id @default(autoincrement())
+  partenaire_id String           @db.Uuid
+  collecteur_id BigInt
+  planning_id   BigInt?
+  titre         String           @db.VarChar(200)
+  description   String?          @db.Text
+  date_debut    DateTime         @db.Date
+  statut        StatutItineraire @default(brouillon)
+  date_envoi    DateTime?        @db.Timestamptz(6)
+  created_at    DateTime         @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime         @updatedAt @db.Timestamptz(6)
+
+  partenaire Profile          @relation("PartenaireItineraires", fields: [partenaire_id], references: [id])
+  collecteur Collecteur        @relation(fields: [collecteur_id], references: [id])
+  planning   Planning?         @relation(fields: [planning_id], references: [id])
+  arrets     ItineraireStop[]
+
+  @@map("itineraires")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : ItineraireStop
+//
+// Arrêt d'un itinéraire : quartier et/ou point de dépôt.
+// Le collecteur valide chaque arrêt (est_valide).
+// ============================================================
+model ItineraireStop {
+  id              BigInt    @id @default(autoincrement())
+  itineraire_id   BigInt
+  localisation_id BigInt?
+  depot_id        BigInt?
+  ordre           Int       @default(0)
+  heure_passage   String?   @db.VarChar(5)
+  notes           String?   @db.Text
+  est_valide      Boolean   @default(false)
+  date_validation DateTime? @db.Timestamptz(6)
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+
+  itineraire   Itineraire    @relation(fields: [itineraire_id], references: [id], onDelete: Cascade)
+  localisation Localisation? @relation(fields: [localisation_id], references: [id])
+  depot        Depot?        @relation(fields: [depot_id], references: [id])
+
+  @@map("itineraire_stops")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : Prime
+//
+// Récompense attribuée à un citoyen lorsqu'il est éligible.
+// Créée par l'administrateur ou automatiquement selon les règles.
+// ============================================================
+model Prime {
+  id          BigInt      @id @default(autoincrement())
+  citoyen_id  String      @db.Uuid
+  montant     Decimal     @db.Decimal(10, 2)    // Montant en FCFA ou points
+  motif       String      @db.Text              // Raison de la prime
+  statut      StatutPrime @default(en_attente)
+  date_prime  DateTime    @default(now()) @db.Timestamptz(6)
+  date_versement DateTime? @db.Timestamptz(6)
+  created_at  DateTime    @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime    @updatedAt @db.Timestamptz(6)
+
+  // Relations
+  citoyen     Profile @relation("CitoyenPrimes", fields: [citoyen_id], references: [id])
+
+  @@map("primes")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : UserSettings
+//
+// Paramètres personnels de chaque utilisateur.
+// Un seul enregistrement par utilisateur (relation 1-1).
+// ============================================================
+model UserSettings {
+  id                  BigInt   @id @default(autoincrement())
+  profile_id          String   @unique @db.Uuid
+  dark_mode           Boolean  @default(false)   // Mode sombre activé
+  notifications_push  Boolean  @default(true)    // Notifications push
+  notifications_email Boolean  @default(false)   // Notifications par email
+  langue              String   @default("fr") @db.VarChar(5)
+  created_at          DateTime @default(now()) @db.Timestamptz(6)
+  updated_at          DateTime @updatedAt @db.Timestamptz(6)
+
+  // Relations
+  profile Profile @relation(fields: [profile_id], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+  @@schema("public")
+}
+
+// ============================================================
+// MODÈLE : ChatMessage
+//
+// Historique des messages entre l'utilisateur et le chatbot IA.
+// role = 'user' → message de l'utilisateur
+// role = 'assistant' → réponse du chatbot
+// ============================================================
+model ChatMessage {
+  id         BigInt   @id @default(autoincrement())
+  user_id    String   @db.Uuid
+  role       String   @db.VarChar(20)   // 'user' | 'assistant'
+  contenu    String   @db.Text
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  // Relations
+  user Profile @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("chat_messages")
+  @@schema("public")
+}
+

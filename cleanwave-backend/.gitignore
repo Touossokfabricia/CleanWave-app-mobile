@@ -1,0 +1,25 @@
+# Fichiers ignorés par Git
+# Ne JAMAIS commiter ces fichiers !
+
+# Variables d'environnement (contiennent des secrets)
+.env
+.env.local
+.env.production
+
+# Dépendances NPM (trop lourdes pour Git)
+node_modules/
+
+# Prisma : client généré (se recrée avec "prisma generate")
+node_modules/.prisma/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Système d'exploitation
+.DS_Store
+Thumbs.db
+
+# Éditeurs de code
+.vscode/
+.idea/
